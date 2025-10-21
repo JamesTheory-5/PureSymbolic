@@ -291,3 +291,221 @@ If you want, I can add convenience creators for:
 * biquad from **(f0, Q, type)** (lowpass, bandpass, etc.),
 * an **LFO** to modulate a delay (phaser/flanger) by writing `D(t)` and re-sampling,
 * a compact **audio writer** (WAV) to hear the results.
+
+---
+
+ohhh that’s a gorgeous idea. let’s make a tiny “symbolic” builder that takes a **Fourier spec** (partials) and optional **delay specs**, then **unrolls** them into a single difference-equation kernel:
+
+[
+H(z)=\frac{B(z)}{A(z)}\quad\Rightarrow\quad
+y[n]=\sum_{m} b_m,x[n-m]-\sum_{k\ge1} a_k,y[n-k],\ a_0=1.
+]
+
+Key trick: any periodic waveform of period (N=\frac{f_s}{f_0}) can be created by convolving an **impulse train** (period (N)) with **one period** of the waveform. In z-domain that’s:
+
+[
+H(z)=\frac{B(z)}{1-z^{-N}} \quad\text{with } B(z)=\sum_{n=0}^{N-1} h[n],z^{-n},
+]
+
+where (h[n]) is one period, which we can **synthesize from the Fourier series**. From there we can symbolically multiply in any extra feedforward/feedback **delay polynomials** you want.
+
+Here’s a compact, self-contained implementation:
+
+```python
+import numpy as np
+
+# ---------- Kernel runner ----------
+class Kernel:
+    def __init__(self, b, a):
+        a = np.asarray(a, float)
+        if a[0] != 1.0:
+            raise ValueError("a[0] must be 1.")
+        self.b = np.asarray(b, float)
+        self.a = a
+
+    def process(self, x):
+        x = np.asarray(x, float)
+        y = np.zeros_like(x)
+        M = len(self.b) - 1
+        K = len(self.a) - 1
+        for n in range(len(x)):
+            acc = 0.0
+            # feedforward
+            for m in range(M + 1):
+                if n - m >= 0:
+                    acc += self.b[m] * x[n - m]
+            # feedback
+            for k in range(1, K + 1):
+                if n - k >= 0:
+                    acc -= self.a[k] * y[n - k]
+            y[n] = acc
+        return y
+
+# ---------- "Symbolic" builder: Fourier + delays -> (b, a) ----------
+def fourier_period_from_partials(N, partials):
+    """
+    Build one period h[0..N-1] from Fourier partials.
+    partials: iterable of (k, A, phi) with harmonic index k >= 0, amplitude A, phase phi (radians).
+      k=0 term is DC if provided.
+    """
+    n = np.arange(N)
+    h = np.zeros(N, float)
+    for k, A, phi in partials:
+        if k == 0:
+            h += A * np.ones(N)
+        else:
+            h += A * np.cos(2*np.pi*k*n/N + phi)
+    return h
+
+def poly_from_delay_sum(delays, gains, Lmin=0):
+    """
+    Build a FIR polynomial P(z) = sum_i gains[i] z^{-delays[i]}.
+    Ensures length >= Lmin by padding zeros to the right.
+    """
+    length = max([0] + delays + [Lmin-1]) + 1
+    p = np.zeros(length, float)
+    for d, g in zip(delays, gains):
+        p[d] += g
+    return p
+
+def poly_convolve(p, q):  # multiply polynomials in z^{-1}
+    return np.convolve(p, q)
+
+def poly_add_pad(p, q):
+    L = max(len(p), len(q))
+    pp = np.pad(p, (0, L-len(p)))
+    qq = np.pad(q, (0, L-len(q)))
+    return pp + qq
+
+def build_kernel_from_spec(fs, f0, partials, ff_delays=None, ff_gains=None, fb_delays=None, fb_gains=None):
+    """
+    fs, f0: sample rate & fundamental
+    partials: list of (k, A, phi) Fourier terms at harmonics k * f0
+    ff_delays/gains: extra feedforward delay sum to multiply into B(z)
+    fb_delays/gains: extra feedback delay sum to multiply into A(z) (on the RHS, i.e., denominator)
+                     Interpreted as A(z) *= (1 - sum g_i z^{-D_i})  (so g>0 means +g*y[n-D] on RHS)
+    Returns b, a with a[0]==1.
+    """
+    # 1) period length
+    N = int(round(fs / f0))
+    if N <= 0:
+        raise ValueError("Invalid N from fs/f0")
+
+    # 2) build one period from Fourier series -> B0(z)
+    h = fourier_period_from_partials(N, partials)
+    B = h.copy()  # FIR taps: 0..N-1
+
+    # 3) base denominator is 1 - z^{-N} (impulse-train feedback)
+    A = np.zeros(N + 1, float)
+    A[0], A[-1] = 1.0, -1.0
+
+    # 4) multiply in extra feedforward delays (partials via delays)
+    if ff_delays and ff_gains:
+        FF = poly_from_delay_sum(ff_delays, ff_gains)
+        B = poly_convolve(B, FF)
+
+    # 5) multiply in extra feedback delays  A(z) *= (1 - Σ g z^{-D})
+    if fb_delays and fb_gains:
+        # Build (1 - Σ g z^{-D})
+        FB = poly_from_delay_sum([0] + list(fb_delays), [1.0] + list(-np.asarray(fb_gains)))
+        A = poly_convolve(A, FB)
+
+    # 6) normalize (optional): keep unity peak gain for typical excitations
+    scale = np.max(np.abs(B)) or 1.0
+    B = B / scale
+    return B, A
+
+# ---------- convenience: classic shapes via analytic Fourier series ----------
+def triangle_partials(Nharm=25, phase0=0.0, amp=1.0):
+    # odd harmonics with 1/k^2 and alternating sign
+    parts = [(0, 0.0, 0.0)]
+    sign = 1.0
+    k_used = 0
+    k = 1
+    while k_used < Nharm:
+        if k % 2 == 1:
+            A = amp * (8 / (np.pi**2)) * sign / (k**2)
+            parts.append((k, A, phase0))
+            sign *= -1.0
+            k_used += 1
+        k += 1
+    return parts
+
+def saw_partials(Nharm=50, phase0=0.0, amp=1.0):
+    # all harmonics with 1/k
+    parts = [(0, 0.0, 0.0)]
+    for k in range(1, Nharm+1):
+        A = amp * (2/np.pi) * (1.0/k)
+        parts.append((k, A, phase0 - np.pi/2))  # phase shift to match standard saw
+    return parts
+
+def square_partials(Nharm=50, phase0=0.0, amp=1.0):
+    # odd harmonics with 1/k
+    parts = [(0, 0.0, 0.0)]
+    for k in range(1, 2*Nharm, 2):
+        A = amp * (4/np.pi) * (1.0/k)
+        parts.append((k, A, phase0))
+    return parts
+
+# ---------- demo usage ----------
+if __name__ == "__main__":
+    import matplotlib.pyplot as plt
+
+    fs, f0, dur = 48000, 220, 0.03
+    N = int(fs * dur)
+    t = np.arange(N) / fs
+
+    # 1) Build a triangle *symbolically* from its Fourier partials; unroll to kernel:
+    parts = triangle_partials(Nharm=25, amp=1.0)
+    b, a = build_kernel_from_spec(
+        fs, f0, parts,
+        ff_delays=None, ff_gains=None,     # extra feedforward tap polynomial (optional)
+        fb_delays=None, fb_gains=None      # extra feedback tap polynomial (optional)
+    )
+    k_tri = Kernel(b, a)
+
+    # excite with a single impulse to generate the periodic waveform via 1/(1 - z^-N)
+    x = np.zeros(int(fs*dur)); x[0] = 1.0
+    y_tri = k_tri.process(x)
+
+    # 2) Now "symbolically" add a comb notch: multiply B(z) by (1 + g z^-D)
+    b2, a2 = build_kernel_from_spec(
+        fs, f0, parts,
+        ff_delays=[0, 24], ff_gains=[1.0, 0.6],  # H_ff(z)=1+0.6 z^-24 (notch/comb flavor)
+        fb_delays=None, fb_gains=None
+    )
+    y_tri_comb = Kernel(b2, a2).process(x)
+
+    # 3) Or add feedback peaks: A(z) *= (1 - g z^-D)
+    b3, a3 = build_kernel_from_spec(
+        fs, f0, parts,
+        fb_delays=[32], fb_gains=[0.7]           # H(z) /= (1 - 0.7 z^-32)
+    )
+    y_tri_peaky = Kernel(b3, a3).process(x)
+
+    # plot
+    def plot(t, y, title, xlim=0.02):
+        plt.figure(figsize=(9,3))
+        plt.plot(t[:int(fs*xlim)], y[:int(fs*xlim)], lw=1.0)
+        plt.title(title); plt.xlabel("Time (s)"); plt.ylabel("Amplitude"); plt.grid(True)
+        plt.tight_layout()
+
+    plot(t, y_tri, "Triangle via Symbolic Fourier → Kernel (impulse excited)")
+    plot(t, y_tri_comb, "Triangle with Feedforward Comb (symbolic delay multiply)")
+    plot(t, y_tri_peaky, "Triangle with Feedback Peaks (symbolic delay multiply)")
+    plt.show()
+```
+
+### what this gives you
+
+* **Symbolic in:** Fourier partials `(k, A, φ)` and delay primitives.
+* **Out:** a **single** kernel ((b, a)) that, when fed an **impulse**, produces your periodic waveform; and when you multiply in extra delay polynomials you get subtractive tweaks (notches/peaks) **without leaving the one-line difference equation** world.
+* The *denominator* starts as (1 - z^{-N}) (periodic repetition), then you can multiply more feedback polynomials to add resonances.
+* The *numerator* is literally one period’s samples (B(z)), optionally multiplied by any feedforward delay sums (partials-as-delays).
+
+If you want, I can add:
+
+* a tiny DSL like:
+  `Wave(f0=220).fourier("triangle", Nharm=25).ff("+0 +0.6@24").fb("-0.7@32").build()`
+  that compiles straight to `(b, a)`,
+* or a `to_wav()` helper to listen to the results.
