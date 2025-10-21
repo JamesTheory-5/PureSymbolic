@@ -509,3 +509,308 @@ If you want, I can add:
   `Wave(f0=220).fourier("triangle", Nharm=25).ff("+0 +0.6@24").fb("-0.7@32").build()`
   that compiles straight to `(b, a)`,
 * or a `to_wav()` helper to listen to the results.
+
+---
+
+Yes — **Sympy can handle z-domain / delay algebra** perfectly well 😎
+
+Although Sympy doesn’t have a built-in “digital signal processing” module for (Z) transforms, you can *represent* (z^{-1}) (or any delay operator) symbolically using standard polynomial or rational algebra.
+In other words, (z^{-1}) is just a **symbol** — you can treat it as `z**(-1)` and Sympy will happily manipulate polynomials, expand, simplify, or even solve for coefficients.
+
+---
+
+### 🧩 Basic Example — symbolic Z algebra
+
+```python
+import sympy as sp
+
+z = sp.Symbol('z', complex=True)
+
+# Define a simple transfer function:
+# H(z) = (1 + 0.5 z^-1) / (1 - 0.8 z^-1)
+H = (1 + 0.5*z**-1) / (1 - 0.8*z**-1)
+print("H(z) =", H.simplify())
+
+# Expand numerator and denominator
+H_expanded = sp.together(H)
+num, den = sp.fraction(H_expanded)
+num_poly = sp.Poly(num, z**-1)
+den_poly = sp.Poly(den, z**-1)
+print("B(z) =", num_poly)
+print("A(z) =", den_poly)
+```
+
+That gives you **symbolic feedforward and feedback polynomials**, exactly what your `SynthKernel` uses.
+
+---
+
+### 🔮 Using Sympy to “compile” a symbolic synth
+
+You can literally build symbolic expressions like:
+
+```python
+# Define your symbolic delays and coefficients
+g1, g2, g3 = sp.symbols('g1 g2 g3')
+H = (1 + g1*z**-10 + g2*z**-25) / (1 - g3*z**-30)
+
+# Simplify or expand
+H_expanded = sp.simplify(H)
+num, den = sp.fraction(sp.together(H_expanded))
+```
+
+From there, you can extract **coefficients automatically**:
+
+```python
+num_poly = sp.Poly(num, z**-1)
+b_coeffs = [float(c) for c in num_poly.all_coeffs()]
+
+den_poly = sp.Poly(den, z**-1)
+a_coeffs = [float(c) for c in den_poly.all_coeffs()]
+```
+
+Now `b_coeffs` and `a_coeffs` plug straight into your **`Kernel(b, a)`** class.
+
+---
+
+### ⚙️ You can go even further
+
+Sympy lets you:
+
+* **Factor or expand** filters (`sp.factor`, `sp.expand`)
+* **Symbolically substitute** design parameters (like `r`, `ω0`)
+* **Compute inverse Z-transforms** (using `sympy.inverse_ztransform`)
+* **Generate executable code** (`sp.lambdify` or `.codegen()` to C/Python)
+
+So you could build a system where you write something like:
+
+```python
+H = (1 + 0.6*z**-24) * fourier_triangle(fs, f0, Nharm=25) / (1 - 0.7*z**-32)
+```
+
+and Sympy symbolically expands it, extracts coefficients, and compiles it into your DSP kernel automatically.
+
+---
+
+Would you like me to show a working example of this —
+→ using **Sympy to symbolically build** your transfer function (Fourier + delay filters),
+→ then **auto-compile** it into numeric `(b, a)` arrays for your `Kernel` class?
+
+---
+
+Absolutely—there are two clean ways to do this in the **frequency domain**:
+
+1. **Build the spectrum directly (additive in the DFT bins) → IFFT → overlap–add**
+2. **Take any source, STFT it, shape its spectrum (subtractive) → ISTFT**
+
+Delays and filters are easy in the frequency domain: a time delay of (d) samples is just a **linear phase ramp** (e^{-j2\pi k d/N}) across bins; convolution becomes **multiplication** by (H[k]).
+
+Below are minimal, working sketches for both styles.
+
+---
+
+# 1) Additive synthesis in the frequency domain (IFFT + OLA)
+
+We “paint” partials into the complex spectrum for each frame, enforce Hermitian symmetry for a real signal, **IFFT**, window, and overlap–add. We maintain **phase continuity** per partial across frames (classic phase-vocoder trick):
+
+```python
+import numpy as np
+
+def synth_additive_fft(partials, fs, duration, N=2048, H=512):
+    """
+    Frequency-domain additive synthesizer via IFFT + overlap-add.
+
+    partials: list of dicts
+        [{"f": Hz, "A": amplitude (linear), "phi": initial phase radians}, ...]
+    fs: sample rate
+    duration: seconds
+    N: FFT size (even)
+    H: hop size (0 < H <= N)
+
+    Returns: y (time-domain signal)
+    """
+    T = int(np.ceil(duration * fs))
+    n_frames = 1 + (T - N) // H if T >= N else 1
+    if n_frames < 1:
+        n_frames = 1
+    # output buffer with some extra headroom
+    y = np.zeros(n_frames * H + N, dtype=float)
+
+    # window (Hann) for decent COLA (N/2 hop works well; but H can be different)
+    win = np.hanning(N).astype(float)
+
+    # precompute bin frequencies
+    k = np.arange(N//2 + 1)
+    freqs = k * fs / N
+
+    # keep a running phase φ_k for each partial
+    phases = np.array([p.get("phi", 0.0) for p in partials], dtype=float)
+
+    for frame in range(n_frames):
+        spec = np.zeros(N//2 + 1, dtype=complex)
+
+        # place each partial into nearest bin (simple version; see notes below)
+        for i, p in enumerate(partials):
+            f = p["f"]; A = p["A"]
+            # nearest bin
+            idx = int(round(f * N / fs))
+            if 0 <= idx <= N//2:
+                spec[idx] += A * np.exp(1j * phases[i])
+
+            # phase advance for next frame
+            phases[i] += 2 * np.pi * f * (H / fs)
+
+        # Hermitian symmetry (real IFFT)
+        # Build full spectrum from one-sided spec
+        full = np.zeros(N, dtype=complex)
+        full[:N//2+1] = spec
+        full[N//2+1:] = np.conj(spec[-2:0:-1])
+
+        # IFFT -> time signal frame
+        frame_sig = np.fft.ifft(full).real * win
+
+        # OLA
+        start = frame * H
+        y[start:start+N] += frame_sig
+
+    # normalize
+    m = np.max(np.abs(y)) or 1.0
+    return y[:T] / m
+```
+
+### Try it
+
+```python
+fs = 48000
+duration = 1.0
+partials = [
+    {"f": 220.0, "A": 1.0, "phi": 0.0},
+    {"f": 440.0, "A": 0.5, "phi": 0.0},
+    {"f": 660.0, "A": 0.33, "phi": 0.0},
+]
+y = synth_additive_fft(partials, fs, duration, N=4096, H=1024)
+
+# quick listen/save if you like:
+# import soundfile as sf; sf.write("additive_fft.wav", y, fs)
+```
+
+**Notes / upgrades (if you want more polish):**
+
+* Nearest-bin placement is simple but causes **leakage** if (f) isn’t exactly on a bin. Improve by:
+
+  * using a **bigger FFT** (smaller bin spacing), and/or
+  * **fractional-bin** placement (sinc- or small-kernel interpolation across neighboring bins), and/or
+  * classic **McAulay–Quatieri** sinusoidal modeling (peak picking + phase locking).
+* To add **delays** for any component, multiply that partial’s contribution by
+  (e^{-j2\pi f d / f_s}) (constant per partial), or apply a global delay as a ramp over k:
+  `spec *= np.exp(-1j * 2*np.pi * (k/N) * d)`.
+
+---
+
+# 2) Subtractive in the frequency domain (STFT → mask → ISTFT)
+
+Take any rich source (saw/noise), STFT it, multiply each frame’s spectrum by your **filter magnitude/phase**, then ISTFT. This is the frequency-domain analog of your delay/filter kernel.
+
+```python
+def stft(x, N=2048, H=512, win=None):
+    if win is None:
+        win = np.hanning(N).astype(float)
+    n_frames = 1 + max(0, (len(x) - N) // H)
+    X = []
+    for i in range(n_frames):
+        start = i * H
+        frame = x[start:start+N]
+        if len(frame) < N:
+            frame = np.pad(frame, (0, N - len(frame)))
+        X.append(np.fft.rfft(frame * win))
+    return np.array(X), win
+
+def istft(X, H=512, win=None):
+    N = (X.shape[1]-1) * 2
+    if win is None:
+        win = np.hanning(N).astype(float)
+    n_frames = X.shape[0]
+    y = np.zeros(n_frames * H + N)
+    for i in range(n_frames):
+        frame_spec = X[i]
+        full = np.fft.irfft(frame_spec, n=N)
+        start = i * H
+        y[start:start+N] += full * win
+    # simple COLA normalization for Hann with H=N/2; otherwise you may need a gain fix
+    m = np.max(np.abs(y)) or 1.0
+    return y / m
+
+def design_mag_response(freqs, kind="lowpass", cutoff=4000.0, width=0.1):
+    """
+    Simple magnitude response in frequency domain.
+    kind: 'lowpass', 'highpass', 'comb'
+    width: transition softness (0..1) for low/high; for comb it's notch depth.
+    """
+    H = np.ones_like(freqs, dtype=float)
+    if kind == "lowpass":
+        # smooth roll-off via raised-cosine
+        trans = width * cutoff
+        H = 0.5*(1 - np.tanh((freqs - cutoff)/max(trans,1e-9)))
+    elif kind == "highpass":
+        trans = width * cutoff
+        H = 0.5*(1 + np.tanh((freqs - cutoff)/max(trans,1e-9)))
+    elif kind == "comb":
+        # simple teeth every f0 Hz:
+        f0 = cutoff
+        # notches at multiples of f0
+        phase = (freqs / max(f0,1e-9)) % 1.0
+        H = 0.2 + 0.8*np.cos(2*np.pi*phase)**2  # periodic emphasis/notch
+    return H
+
+# Example: subtractive shaping of noisy source
+fs = 48000
+dur = 1.0
+x = np.random.uniform(-1, 1, int(fs*dur))  # noisy / rich source
+
+N = 2048; H = 1024
+X, win = stft(x, N=N, H=H)
+
+# frequency axis for rfft bins
+k = np.arange(X.shape[1])
+freqs = k * fs / (2*(X.shape[1]-1))
+
+# Make a magnitude response (e.g., resonant-ish lowpass)
+Hmag = design_mag_response(freqs, kind="lowpass", cutoff=3000.0, width=0.2)
+# Apply same response to every frame (static filter)
+X_filt = X * Hmag[None, :]
+
+y_sub = istft(X_filt, H=H, win=win)
+
+# export/listen if desired:
+# import soundfile as sf; sf.write("subtractive_stft.wav", y_sub, fs)
+```
+
+**Delays in frequency domain:** multiply each frame’s spectrum by a **phase ramp**:
+
+```python
+d = 50  # samples of delay
+k = np.arange(X.shape[1])                       # rfft bins
+Nfft = 2*(X.shape[1]-1)
+phase_ramp = np.exp(-1j * 2*np.pi * k * d / Nfft)
+X_delayed = X * phase_ramp[None, :]
+```
+
+---
+
+## How this connects to your “single-line Z/delay kernel”
+
+* In time: ( y[n] = b * x - a * y ) (convolution + recursion)
+* In frequency: **one multiply** per bin: (Y[k] = H[k] X[k]) with
+  (H[k] = \frac{B(e^{j\omega_k})}{A(e^{j\omega_k})}).
+* A **delay of (d)** samples is (H[k] = e^{-j\omega_k d}) (a straight line in phase vs. frequency).
+
+So you can:
+
+* **Symbolically** build (B(z)/A(z)) (with Sympy if you like),
+* Evaluate it on the DFT grid (z = e^{j\omega_k}) to get (H[k]),
+* Apply (H[k]) to any STFT frame or to a white impulse spectrum and IFFT.
+
+If you want, I can wire this all together so you can pass a **symbolic** (H(z)) (with delays) and it’ll:
+
+1. sample (H(e^{j\omega})) on the FFT grid,
+2. do IFFT overlap–add for long signals,
+3. (optionally) maintain phase-continuous partials for additive cases.
